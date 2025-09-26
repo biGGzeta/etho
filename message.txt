@@ -1,0 +1,329 @@
+Python 3.10+
+
+pip install -r requirements.txt
+
+Modos
+
+LIVE (WebSocket Binance Futures):
+
+python bot.py --symbol ETHUSDT --tf 1m --live
+
+
+Archiva velas en data/raw/ETHUSDT_1m.jsonl y procesa en tiempo real.
+
+CSV (Paper/Offline):
+
+python bot.py --symbol ETHUSDT --tf 1m --csv data\sample\ethusdt_1m.csv
+
+Config rápido
+
+config.py:
+
+PAPER_MODE = True | False
+
+DATA_FEED_CSV = None | "ruta\archivo.csv" (si se pasa --csv, tiene prioridad)
+
+ARCHIVE_DIR = "data/raw"
+
+Estructura
+
+bot.py — entrada CLI, orquesta feed LIVE/CSV
+
+config.py — toggles y defaults
+
+websocket_listener.py — WS Binance Futures (kline)
+
+data_store.py — archivado JSONL
+
+processors/basic_processor.py — ejemplo de manejo de velas
+
+requirements.txt — deps mínimas
+
+data/sample/ethusdt_1m.csv — ejemplo opcional
+
+Notas
+
+Si el WS se cae, reintenta exponencial.
+
+TF soportados: 1m, 3m, 5m, etc. (los de Binance).
+
+Para otros símbolos, usá --symbol BTCUSDT, etc.
+
+===END===
+
+===FILE: requirements.txt===
+websocket-client==1.8.0
+pandas==2.2.2
+python-dateutil==2.9.0.post0
+urllib3==2.2.2
+===END===
+
+===FILE: config.py===
+
+Configuración central del bot
+Ejecutar sin real money (solo logs/procesamiento). No envía órdenes.
+
+PAPER_MODE = True
+
+Si querés forzar lectura desde CSV por defecto (modo offline), poné la ruta aquí.
+Si pasás --csv por CLI, esa ruta tiene prioridad sobre esta.
+
+DATA_FEED_CSV = None # Ej: r"D:\datasets\ethusdt_1m.csv"
+
+Dónde se archivan los datos LIVE a medida que llegan (JSONL)
+
+ARCHIVE_DIR = "data/raw"
+
+Timeout y backoff para reconexiones WS
+
+WS_CONNECT_TIMEOUT = 10
+WS_RETRY_BASE_SEC = 1
+WS_RETRY_MAX_SEC = 30
+===END===
+
+===FILE: websocket_listener.py===
+import json
+import threading
+import time
+from datetime import datetime, timezone
+from typing import Callable, Optional
+
+from websocket import WebSocketApp
+
+from config import WS_CONNECT_TIMEOUT, WS_RETRY_BASE_SEC, WS_RETRY_MAX_SEC
+
+BINANCE_FWS = "wss://fstream.binance.com/stream?streams={stream}"
+
+def build_kline_stream(symbol: str, tf: str) -> str:
+# Binance espera símbolos en minúscula
+stream = f"{symbol.lower()}@kline_{tf}"
+return BINANCE_FWS.format(stream=stream)
+
+class WebSocketManager:
+"""
+Listener simple para velas de Binance Futures (kline).
+Llama a on_kline(dict) cada vez que llega una vela (parcial/cierre).
+"""
+def init(self, symbol: str, tf: str, on_kline: Callable[[dict], None]):
+self.symbol = symbol.upper()
+self.tf = tf
+self.on_kline = on_kline
+self._ws: Optional[WebSocketApp] = None
+self._thread: Optional[threading.Thread] = None
+self._stop = threading.Event()
+
+def _on_message(self, ws, message):
+    try:
+        data = json.loads(message)
+        k = data.get("data", {}).get("k", {})
+        if not k:
+            return
+        # Normalizamos un dict de vela
+        payload = {
+            "symbol": self.symbol,
+            "tf": self.tf,
+            "ts_open": int(k.get("t", 0)),
+            "ts_close": int(k.get("T", 0)),
+            "open": float(k.get("o", 0)),
+            "high": float(k.get("h", 0)),
+            "low": float(k.get("l", 0)),
+            "close": float(k.get("c", 0)),
+            "volume": float(k.get("v", 0)),
+            "is_closed": bool(k.get("x", False)),
+        }
+        self.on_kline(payload)
+    except Exception as e:
+        print(f"[WS][on_message][ERROR] {e}")
+
+def _on_error(self, ws, error):
+    print(f"[WS][ERROR] {error}")
+
+def _on_close(self, ws, code, msg):
+    print(f"[WS][CLOSE] code={code} msg={msg}")
+
+def _on_open(self, ws):
+    print(f"[WS][OPEN] {self.symbol} {self.tf} @ {datetime.now(timezone.utc).isoformat()}")
+
+def start(self):
+    url = build_kline_stream(self.symbol, self.tf)
+    backoff = WS_RETRY_BASE_SEC
+    while not self._stop.is_set():
+        try:
+            self._ws = WebSocketApp(
+                url,
+                on_open=self._on_open,
+                on_message=self._on_message,
+                on_error=self._on_error,
+                on_close=self._on_close,
+            )
+            self._thread = threading.Thread(target=self._ws.run_forever, kwargs={"ping_interval": 20}, daemon=True)
+            self._thread.start()
+            # Esperamos a que el hilo arranque
+            time.sleep(1)
+            # Loop de vida: si nos piden stop, cortamos
+            while self._thread.is_alive() and not self._stop.is_set():
+                time.sleep(0.5)
+        except Exception as e:
+            print(f"[WS][EXC] {e}")
+        if self._stop.is_set():
+            break
+        # Backoff
+        time.sleep(backoff)
+        backoff = min(backoff * 2, WS_RETRY_MAX_SEC)
+
+def stop(self):
+    self._stop.set()
+    try:
+        if self._ws:
+            self._ws.close()
+    except:
+        pass
+    if self._thread and self._thread.is_alive():
+        self._thread.join(timeout=3)
+
+
+===END===
+
+===FILE: data_store.py===
+from pathlib import Path
+import json
+from datetime import datetime, timezone
+
+from config import ARCHIVE_DIR
+
+def ensure_dir(path: Path):
+path.mkdir(parents=True, exist_ok=True)
+
+def archive_kline(symbol: str, tf: str, candle: dict):
+"""
+Guarda cada kline recibido (LIVE) como una línea JSON.
+"""
+ensure_dir(Path(ARCHIVE_DIR))
+fname = Path(ARCHIVE_DIR) / f"{symbol.upper()}_{tf}.jsonl"
+record = {
+"ts": datetime.now(timezone.utc).isoformat(),
+**candle
+}
+with open(fname, "a", encoding="utf-8") as f:
+f.write(json.dumps(record, ensure_ascii=False) + "\n")
+===END===
+
+===FILE: processors/basic_processor.py===
+from typing import Dict
+from datetime import datetime
+
+class BasicProcessor:
+"""
+Ejemplo minimal de procesador de velas.
+- Loguea últimas velas
+- Podés enchufar aquí tus señales/estrategias
+"""
+
+def __init__(self):
+    self.last_close = None
+    self.count = 0
+
+def on_candle(self, cndl: Dict):
+    self.count += 1
+    self.last_close = cndl["close"]
+    tag = "CLOSE" if cndl.get("is_closed") else "LIVE"
+    ts = datetime.fromtimestamp(cndl["ts_close"]/1000).isoformat(timespec="seconds")
+    print(f"[{tag}] {cndl['symbol']} {cndl['tf']} {ts} O={cndl['open']} H={cndl['high']} L={cndl['low']} C={cndl['close']} V={cndl['volume']}")
+
+
+===END===
+
+===FILE: bot.py===
+import argparse
+from pathlib import Path
+import sys
+import pandas as pd
+
+from config import PAPER_MODE, DATA_FEED_CSV
+from websocket_listener import WebSocketManager
+from data_store import archive_kline
+from processors.basic_processor import BasicProcessor
+
+def run_live(symbol: str, tf: str):
+proc = BasicProcessor()
+
+def on_kline(cndl: dict):
+    # 1) procesar
+    proc.on_candle(cndl)
+    # 2) archivar
+    archive_kline(symbol, tf, cndl)
+
+ws = WebSocketManager(symbol, tf, on_kline)
+try:
+    ws.start()
+except KeyboardInterrupt:
+    print("[LIVE] Stop solicitado por usuario.")
+    ws.stop()
+
+
+def run_csv(symbol: str, tf: str, csv_path: str):
+proc = BasicProcessor()
+print(f"[CSV] Cargando {csv_path} ...")
+df = pd.read_csv(csv_path)
+# Esperamos columnas típicas: open_time, open, high, low, close, volume, close_time
+# Adaptá aquí si tu CSV cambia
+required = {"open_time","open","high","low","close","volume","close_time"}
+if not required.issubset(set(map(str.lower, df.columns))):
+print("[CSV] Columnas esperadas (case-insensitive):", required)
+sys.exit(1)
+
+# Normalizamos nombres por si vienen con mayúsculas
+cols = {c: c.lower() for c in df.columns}
+df.rename(columns=cols, inplace=True)
+
+for _, r in df.iterrows():
+    cndl = {
+        "symbol": symbol.upper(),
+        "tf": tf,
+        "ts_open": int(r["open_time"]),
+        "ts_close": int(r["close_time"]),
+        "open": float(r["open"]),
+        "high": float(r["high"]),
+        "low": float(r["low"]),
+        "close": float(r["close"]),
+        "volume": float(r["volume"]),
+        "is_closed": True,
+    }
+    proc.on_candle(cndl)
+
+
+def main():
+ap = argparse.ArgumentParser(description="ethbotgrid LIVE/CSV runner")
+ap.add_argument("--symbol", required=True, help="Ej: ETHUSDT")
+ap.add_argument("--tf", required=True, help="Ej: 1m, 3m, 5m...")
+mode = ap.add_mutually_exclusive_group(required=False)
+mode.add_argument("--live", action="store_true", help="Modo LIVE (WebSocket)")
+mode.add_argument("--csv", type=str, help="Ruta CSV (Paper Mode)")
+
+args = ap.parse_args()
+
+# Resolver CSV por CLI > config
+csv_path = args.csv if args.csv else DATA_FEED_CSV
+
+if args.live:
+    print(f"[LIVE] PAPER_MODE={PAPER_MODE} | {args.symbol} {args.tf}")
+    run_live(args.symbol, args.tf)
+elif csv_path:
+    print(f"[CSV] PAPER_MODE={PAPER_MODE} | {args.symbol} {args.tf} | {csv_path}")
+    run_csv(args.symbol, args.tf, csv_path)
+else:
+    print("Debes usar --live ó --csv RUTA. También podés setear DATA_FEED_CSV en config.py.")
+    sys.exit(2)
+
+
+if name == "main":
+main()
+===END===
+
+===FILE: data/sample/ethusdt_1m.csv===
+open_time,open,high,low,close,volume,close_time
+1717992000000,3795.10,3796.25,3794.80,3795.55,120.2,1717992059999
+1717992060000,3795.55,3796.10,3795.00,3795.80,98.0,1717992119999
+1717992120000,3795.80,3797.00,3795.60,3796.90,150.5,1717992179999
+===END===
+

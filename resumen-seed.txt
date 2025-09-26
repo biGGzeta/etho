@@ -1,0 +1,57 @@
+[ETHBOTGRID_PRIMER / v: maker-safe + epoch TP/SL + reconcile_grid]
+
+Mercado:
+- Binance Futures USDT-M | Par: ETHUSDT | Modo: Long-only | Leverage: 10x
+- Tamaño por orden: 10 USDT * 10x  → qty ≈ 100 / precio
+
+Estrategia (Grid DCA dinámico):
+- Rango dinámico: 6–15% por debajo del precio actual
+- Spacing dinámico: 0.30%–0.75%
+- Construcción de niveles: precios decrecientes desde el precio actual, con spacing y rango actuales
+- Cap por margen: limitar # de órdenes por balance disponible (conservador)
+
+Señales WebSocket:
+- TRADE (dump): alta frecuencia + dominancia de ventas → usar spacing MAX (alejar grid)
+- DEPTH (soporte): muro BID (vol. top5 relativo) → usar spacing MIN (acercar grid)
+- miniTicker: actualiza precio de referencia (para rango/spacing dinámicos)
+- USER (ORDER_TRADE_UPDATE): confirma fills (BUY/SELL) con fee, actualiza estado y activa TP/SL
+
+Maker-safe (Post-Only):
+- Todas las órdenes LIMIT son GTX (post-only, maker)
+- BUY maker-safe: precio ≤ best_bid − 1 * tick
+- SELL maker-safe (TP): precio ≥ best_ask + 1 * tick
+- Redondeo/format estricto según tickSize/stepSize/precisiones del símbolo
+
+Gestión de órdenes:
+- Rebalance por “diff”: reconcile_grid() cancela solo lo que sobra y crea lo que falta (tolerancia)
+- IDs propios (clientOrderId) para TPs/SL por epoch: TP_{epoch}_A, TP_{epoch}_B, SL_{epoch}
+
+TP / SL (por epoch de posición):
+- Epoch: cuando la posición pasa 0 → >0, incrementa position_epoch
+- TP base: avg_cost * (1 + 0.30% neto fees)
+- Offsets según volatilidad (spacing): 
+  - baja: +0.03% / +0.03%
+  - media: +0.05% / +0.05%
+  - alta:  +0.05% / +0.07%
+- ensure_take_profits(): coloca/actualiza SOLO los 2 TP del epoch actual (reduceOnly, GTX)
+- SL global: STOP-MARKET closePosition en avg_cost * (1 − SL%), ensure_stop_loss() (1 único por epoch)
+- Ventas parciales: descuentan costo proporcional; si posición vuelve a 0 → limpia TP/SL y cierra epoch
+
+Persistencia (JSON):
+- posicion_total, costo_total, fees_total, fills[]
+- position_epoch
+- tp_orders {epoch, A, B}
+- sl_order  {epoch, clientOrderId, stopPrice}
+- grids_activados[] (histórico opcional)
+
+Modos:
+- PAPER_MODE: sin endpoints privados (simula)
+- TESTNET/PROD: claves separadas; time sync + recvWindow ajustados
+- Seguridad: limitar notional y # de órdenes; claves sin retiro
+
+Qué puedo hacer al retomar:
+- Ajustar ticks maker-safe (1→2) si spread es fino
+- Histeresis/EMA para spacing y rango (anti-flapping)
+- Telegram alerts (fills, TP/SL, reconexiones)
+- CLI básico (pause/resume/flatten/status)
+- Backtest/sim con data histórica
