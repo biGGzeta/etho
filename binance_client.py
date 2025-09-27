@@ -6,6 +6,22 @@ from config import API_KEY, API_SECRET, SYMBOL, LEVERAGE, USE_TESTNET, PAPER_MOD
 class BinanceClient:
     def __init__(self):
         # python-binance: testnet=True para Futures testnet
+        # Skip network calls in PAPER_MODE
+        if PAPER_MODE:
+            print("[INFO] PAPER_MODE - Skipping Binance client initialization")
+            self.client = None
+            self._ex_info = None
+            self._symbol_specs = {}
+            # Set default specs for PAPER_MODE
+            self._symbol_specs[SYMBOL] = {
+                "tickSize": Decimal("0.01"),
+                "stepSize": Decimal("0.001"),
+                "minQty": Decimal("0.001"),
+                "pricePrecision": 2,
+                "quantityPrecision": 3,
+            }
+            return
+            
         self.client = Client(API_KEY, API_SECRET, testnet=USE_TESTNET)
         self._ex_info = None
         self._symbol_specs = {}

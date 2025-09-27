@@ -39,3 +39,16 @@ LOG_LEVEL = "INFO"
 TELEGRAM_ENABLED = False
 TELEGRAM_TOKEN = ""  # ej. "123456:ABC..."
 TELEGRAM_CHAT_ID = ""  # ej. 123456789
+
+# === SCALPING CONFIGURATION ===
+try:
+    from scalping_config import *
+    if SCALP_MODE:
+        # Override some settings for scalping
+        REBALANCE_SECONDS = SCALP_REBALANCE_SECONDS
+        MIN_GRID_SPACING = MIN_GRID_SPACING / 2  # Tighter grid for scalping
+        STOP_LOSS_PERCENTAGE = SCALP_TIGHT_SL_PERCENTAGE
+        print("[CONFIG] Scalping mode ENABLED - Using optimized settings")
+except ImportError:
+    SCALP_MODE = False
+    print("[CONFIG] Scalping config not found - Using default settings")

@@ -31,8 +31,19 @@ class GridBot:
     def __init__(self):
         self.log = get_logger("bot")
         self.client = BinanceClient()
-        # ✅ pasamos el cliente al OrderManager
-        self.orders = OrderManager(client=self.client, logger=self.log)
+        
+        # Use scalping order manager if scalping mode is enabled
+        try:
+            from config import SCALP_MODE
+            if SCALP_MODE:
+                from scalping_orders import ScalpingOrderManager
+                self.orders = ScalpingOrderManager(client=self.client, logger=self.log)
+                print(f"[INFO] Using ScalpingOrderManager for optimized scalping")
+            else:
+                self.orders = OrderManager(client=self.client, logger=self.log)
+        except ImportError:
+            self.orders = OrderManager(client=self.client, logger=self.log)
+            
         self.state = StateManager()
 
         self.last_price = None
@@ -40,17 +51,43 @@ class GridBot:
         self.current_spacing = (MIN_GRID_SPACING + MAX_GRID_SPACING) / 2
         self.current_range = (GRID_RANGE_MIN + GRID_RANGE_MAX) / 2
         self._last_rebalance = 0
+        self._scalp_mode = getattr(self, '_check_scalp_mode', lambda: False)()
 
         env = 'TEST' if getattr(self.client.client, 'testnet', False) else 'PROD'
-        print(f"[INFO] PAPER_MODE={'ON' if PAPER_MODE else 'OFF'} | ENV={env} | Symbol={SYMBOL}")
+        scalp_status = "SCALP" if self._scalp_mode else "GRID"
+        print(f"[INFO] PAPER_MODE={'ON' if PAPER_MODE else 'OFF'} | ENV={env} | Mode={scalp_status} | Symbol={SYMBOL}")
         print(f"[ESTRATEGIA] TP configurado para un {ROI_DESEADO*100}% de ROI con apalancamiento x{LEVERAGE}")
+    
+    def _check_scalp_mode(self):
+        """Check if scalping mode is enabled"""
+        try:
+            from config import SCALP_MODE
+            return SCALP_MODE
+        except ImportError:
+            return False
+    
+    def _is_scalping_signal(self):
+        """Check if current signal is a scalping signal"""
+        return self.last_signal in ['SCALP_DOWN', 'SCALP_UP', 'MOMENTUM_DOWN', 'MOMENTUM_UP']
 
     # ------------------ Handlers de WS ------------------ #
     async def procesar_trade(self, msg):
         sig = strategy.analizar_trade(msg)
-        if sig == 'DUMP':
+        if sig:
             self.last_signal = sig
-            print("[ESTRATEGIA] Caída rápida detectada → spacing MAX")
+            # Handle different signal types
+            if sig == 'DUMP':
+                print("[ESTRATEGIA] Caída rápida detectada → spacing MAX")
+            elif sig == 'SCALP_DOWN':
+                print("[ESTRATEGIA] Micro-dump detectado → grid denso para scalping")
+            elif sig == 'SCALP_UP':
+                print("[ESTRATEGIA] Micro-pump detectado → grid cercano para entrada rápida")
+            elif sig == 'MOMENTUM_DOWN':
+                print("[ESTRATEGIA] Momentum bajista → aprovechar caída")
+            elif sig == 'MOMENTUM_UP':
+                print("[ESTRATEGIA] Momentum alcista → entrada conservadora")
+            elif sig == 'CALMA':
+                print("[ESTRATEGIA] Mercado en calma → grid balanceado")
 
         # precio last de trade
         try:
@@ -104,14 +141,29 @@ class GridBot:
         now = time.time()
         if self.last_price is None:
             return
-        if now - self._last_rebalance < REBALANCE_SECONDS:
+        
+        # Rebalance más frecuente para señales de scalping
+        rebalance_delay = REBALANCE_SECONDS
+        if self.last_signal in ['SCALP_DOWN', 'SCALP_UP', 'MOMENTUM_DOWN', 'MOMENTUM_UP']:
+            rebalance_delay = REBALANCE_SECONDS // 3  # 3x más rápido para scalping
+        elif self.last_signal == 'DUMP':
+            rebalance_delay = REBALANCE_SECONDS // 2  # 2x más rápido para dumps
+            
+        if now - self._last_rebalance < rebalance_delay:
             return
 
         # Recomendar spacing y rango según señal
         self.current_spacing = strategy.recomendar_spacing(self.last_signal, MIN_GRID_SPACING, MAX_GRID_SPACING)
         self.current_range = strategy.recomendar_rango(self.last_signal, GRID_RANGE_MIN, GRID_RANGE_MAX)
 
-        niveles = strategy.construir_grid(self.last_price, self.current_spacing, self.current_range)
+        # Usar grid de scalping si tenemos señales de scalping/momentum
+        if self.last_signal in ['SCALP_DOWN', 'SCALP_UP', 'MOMENTUM_DOWN', 'MOMENTUM_UP', 'CALMA']:
+            niveles = strategy.construir_grid_scalping(self.last_price, self.last_signal, 
+                                                     self.current_spacing, self.current_range)
+            grid_type = "SCALP"
+        else:
+            niveles = strategy.construir_grid(self.last_price, self.current_spacing, self.current_range)
+            grid_type = "REGULAR"
 
         # Cap por margen disponible
         niveles = await self._cap_por_margen(niveles)
@@ -120,7 +172,7 @@ class GridBot:
         if not niveles:
             return
 
-        print(f"[GRID] Rebalance spacing={round(self.current_spacing*100,2)}% "
+        print(f"[{grid_type}] Rebalance spacing={round(self.current_spacing*100,2)}% "
               f"range={round(self.current_range*100,2)}% niveles={len(niveles)}")
 
         if PAPER_MODE:
@@ -129,12 +181,17 @@ class GridBot:
                 print(f"[PAPER][BUY] LIMIT {p} x {qty}")
             return
 
-        # ✅ Reconcile (diff) si está disponible, sino fallback a cancelar y recrear
+        # ✅ Use scalping batch orders for scalping signals, regular grid otherwise
         try:
-            if hasattr(self.orders, "reconcile_grid"):
+            if hasattr(self.orders, "reconcile_grid") and not self._is_scalping_signal():
                 stats = self.orders.reconcile_grid(niveles)
                 print(f"[GRID] reconcile: {stats}")
+            elif hasattr(self.orders, "place_scalp_orders_batch") and self._is_scalping_signal():
+                # Use scalping batch order placement
+                result = await self.orders.place_scalp_orders_batch(niveles, str(self.last_signal))
+                print(f"[SCALP] batch orders: {result['success']} success, {result['failed']} failed")
             else:
+                # Fallback to standard order placement
                 self.orders.cancelar_todas()
                 for p in niveles:
                     qty = self.orders.calcular_cantidad(p)
